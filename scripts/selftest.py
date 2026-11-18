@@ -6,6 +6,10 @@
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
 3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+4. ``clock``: wall-clock jumps in both directions cannot extend or shorten a
+   lease; expiry is measured on the monotonic clock within one host boot.
+5. ``reboot``: a lease left by a previous boot (different kernel boot id) is
+   reclaimed immediately, and training resumes from the last checkpoint.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -23,6 +27,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 LEASE = 2.0
 HEARTBEAT = 0.3
 DELAY = 0.2
@@ -271,6 +276,118 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_clock_adjustment(tmp: Path) -> bool:
+    """Wall-clock corrections must not change lease expiry within one boot."""
+    from app import clock, lease as lm, store
+    from app.db import init_db
+
+    db = tmp / "clock.db"
+    init_db(db)
+    lease_seconds = 0.6
+
+    class FakeClock:
+        def __init__(self):
+            self.mono_value = 1000.0
+            self.wall_value = 1_700_000_000.0
+            self.boot_value = "boot-A"
+
+    fake = FakeClock()
+    real_mono, real_wall, real_boot = clock.mono, clock.wall, clock.boot_id
+    clock.mono = lambda: fake.mono_value
+    clock.wall = lambda: fake.wall_value
+    clock.boot_id = lambda: fake.boot_value
+    lm.clock = clock  # lease module imported the same facade object
+    try:
+        rng = __import__("numpy").random.default_rng(0)
+        features = rng.normal(size=(24, 3)).tolist()
+        labels = [i % 2 for i in range(24)]
+        job = store.create_job(db, features, labels, 3)
+        lm.register_worker(db, "worker-a")
+        lm.register_worker(db, "worker-b")
+        lease = lm.acquire(db, job["job_id"], "worker-a", lease_seconds)
+        store.advance_job(db, lease)
+
+        # Forward jump of three hours with no real elapsed time: still owned.
+        fake.wall_value += 3 * 3600
+        assert lm.acquire(db, job["job_id"], "worker-b", lease_seconds) is None
+        assert lm.renew(db, lease, lease_seconds) is True
+
+        # The lease term elapses on the monotonic clock, then the wall clock is
+        # wound backwards by a day: the dead holder must still be replaceable.
+        fake.mono_value += lease_seconds + 0.1
+        fake.wall_value -= 24 * 3600
+        taken = lm.acquire(db, job["job_id"], "worker-b", lease_seconds)
+        assert taken is not None and taken.epoch == lease.epoch + 1
+    finally:
+        clock.mono, clock.wall, clock.boot_id = real_mono, real_wall, real_boot
+
+    print(
+        "  PASS: a 3h forward jump keeps a live lease and a 1d backward jump "
+        "after real expiry still allows takeover"
+    )
+    return True
+
+
+def check_reboot_reclaim(tmp: Path) -> bool:
+    """A leftover lease from a previous host boot is stale immediately."""
+    from app import clock, lease as lm, store
+    from app.db import init_db
+
+    db = tmp / "reboot.db"
+    init_db(db)
+    lease_seconds = 0.6
+
+    class FakeClock:
+        def __init__(self):
+            self.mono_value = 500.0
+            self.boot_value = "boot-one"
+
+    fake = FakeClock()
+    real_mono, real_boot = clock.mono, clock.boot_id
+    clock.mono = lambda: fake.mono_value
+    clock.boot_id = lambda: fake.boot_value
+    lm.clock = clock
+    try:
+        rng = __import__("numpy").random.default_rng(4)
+        features = rng.normal(size=(24, 3)).tolist()
+        labels = [i % 2 for i in range(24)]
+        job = store.create_job(db, features, labels, 3)
+        lm.register_worker(db, "worker-a")
+        old = lm.acquire(db, job["job_id"], "worker-a", lease_seconds)
+        for _ in range(3):
+            store.advance_job(db, old)
+        before = store.get_job(db, job["job_id"])
+        assert before["completed_steps"] == 3
+
+        # Reboot: new boot id and monotonic time restarting near zero.
+        fake.boot_value = "boot-two"
+        fake.mono_value = 1.0
+        lm.register_worker(db, "worker-b")
+        new = lm.acquire(db, job["job_id"], "worker-b", lease_seconds)
+        assert new is not None and new.epoch == old.epoch + 1
+        try:
+            store.advance_job(db, old)
+            raise AssertionError("previous-boot holder was not fenced out")
+        except lm.LeaseLost:
+            pass
+        while True:
+            result = store.advance_job(db, new)
+            if result["status"] == "completed":
+                break
+        final = store.get_job(db, job["job_id"])
+        steps = [c["step"] for c in store.list_checkpoints(db, job["job_id"])]
+        assert final["status"] == "completed"
+        assert steps == list(range(1, final["total_steps"] + 1))
+    finally:
+        clock.mono, clock.boot_id = real_mono, real_boot
+
+    print(
+        "  PASS: previous-boot lease reclaimed at once (no lease-term wait), "
+        "old holder fenced, job resumed from step 3 to completion"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +396,8 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("clock adjustment", lambda: check_clock_adjustment(tmp)),
+            ("host reboot reclaim", lambda: check_reboot_reclaim(tmp)),
         ):
             print(f"[{name}]")
             try:

@@ -23,6 +23,7 @@ from typing import Any
 
 import numpy as np
 
+from . import clock
 from .db import reader, transaction
 from .features import (
     BATCH_SIZE,
@@ -318,7 +319,7 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         new_completed = completed + 1
         final = new_completed == total_steps
         evaluation = dataset_loss(new_weights, design, targets)
-        now = time.time()
+        now = clock.wall()
 
         updated = conn.execute(
             """
@@ -361,7 +362,8 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
             ),
         )
         conn.execute(
-            "UPDATE leases SET heartbeat_at=? WHERE job_id=?", (now, lease.job_id)
+            "UPDATE leases SET heartbeat_at=?, boot_id=?, mono_at=? WHERE job_id=?",
+            (now, clock.boot_id(), clock.mono(), lease.job_id),
         )
         if final:
             _event(

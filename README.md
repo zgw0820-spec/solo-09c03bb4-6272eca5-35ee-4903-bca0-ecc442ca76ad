@@ -63,6 +63,33 @@ docker compose up -d --build
 4. 完成状态由 `step == total_steps` 在提交事务内一次性置位；旧工作器无法再写入。
 5. SQLite 使用 WAL + `synchronous=FULL`，已提交的断点在进程崩溃/容器重启后仍然存在。
 
+## 租约计时：单调时钟 + 开机周期
+
+租约是否过期**绝不使用墙上时钟** `time.time()`，因为值班工程师校时会把系统时间
+整体前跳或回拨数小时：
+
+- 时间**回拨**会让已退出工作器留下的租约在墙上时间里长期"新鲜"，接管被挡住数小时；
+- 时间**前跳**会让仍在正常训练、持续心跳的持有者瞬间"过期"而被提前踢掉。
+
+每个心跳同时写入两列计时信息（见 `app/clock.py`）：
+
+| 列 | 含义 | 作用 |
+| --- | --- | --- |
+| `mono_at` | 写入时的 `time.monotonic()` 读数 | 单调时钟只增不减，`settimeofday`/NTP 校时不影响它；同一开机周期内只用真实流逝时间判断到期 |
+| `boot_id` | 写入时的内核开机标识（`/proc/sys/kernel/random/boot_id`） | 同一宿主机开机周期内恒定，每次重启都变化；容器共享宿主机内核，三个容器读到同一个值 |
+
+过期判定（`lease.is_stale`，接管与 `/workers` 共用同一个谓词）：
+
+1. 心跳的 `boot_id` 与当前开机标识**不同** → 来自上一个开机周期，**立即视为过期**，
+   不必等满租期。宿主机重启后遗留的租约不会再让任务停滞，存活工作器立刻从最近断点接续。
+2. `boot_id` 相同但 `monotonic() - mono_at >= 租约秒数` → 按真实流逝时间过期。
+   无论墙上时钟前跳还是回拨，同一开机周期内都不能提前夺走仍有效持有者的租约，也不能
+   延长一个已死持有者的租约。
+
+`heartbeat_at` 墙上时间仍保留，仅供展示与审计，不参与任何过期判断。`TRAINING_BOOT_ID`
+环境变量可覆盖开机标识，用于在测试里确定性地模拟宿主机重启。旧版本数据库启动时会幂等
+迁移出 `boot_id`/`mono_at` 两列；旧行的 `boot_id` 为空，升级后立即视为过期，不会卡住。
+
 ## 演示与验证
 
 ```bash
@@ -88,10 +115,11 @@ python3 -m pytest -q
 | --- | --- | --- |
 | `TRAINING_DATA_DIR` | `./data` | 数据库目录 |
 | `TRAINING_DB_PATH` | `$TRAINING_DATA_DIR/training.db` | 共享数据库 |
-| `TRAINING_LEASE_SECONDS` | `6` | 租约超时 |
+| `TRAINING_LEASE_SECONDS` | `6` | 租约超时（按单调时钟的真实流逝时间计） |
 | `TRAINING_HEARTBEAT_INTERVAL` | `1.0` | 心跳间隔（必须小于租约） |
 | `TRAINING_POLL_INTERVAL` | `0.3` | 空闲轮询/批间间隔 |
 | `TRAINING_BATCH_DELAY_SECONDS` | `0` | 模拟每批耗时，便于演示 |
+| `TRAINING_BOOT_ID` | 内核 `/proc/.../boot_id` | 开机周期标识覆盖；测试模拟重启用，正常运行无需设置 |
 | `TRAINING_DEMO_PAUSE_FILE` | 未设置 | 演示用：文件存在时在批间暂停（不心跳） |
 | `TRAINING_DEMO_CRASH_AFTER` | 未设置 | 演示用：指定步数提交后 `os._exit` |
 
@@ -99,13 +127,14 @@ python3 -m pytest -q
 
 ```
 app/main.py       API 与 Swagger
+app/clock.py      单调时钟与开机周期标识（校时/重启安全的计时门面）
 app/worker.py     工作器主循环、租约续训
 app/store.py      任务状态机、批次提交、断点查询
-app/lease.py      租约获取/续约/围栏校验
+app/lease.py      租约获取/续约/围栏校验、过期判定谓词
 app/model.py      逻辑回归、交叉熵、SGD + 动量
 app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+app/db.py         SQLite 连接、表结构与旧库迁移
+tests/            单元、API、进程级集成测试（含校时与重启）
 scripts/demo.py   Swagger 同款接口的端到端演示
-scripts/selftest.py  无 Docker 自检
+scripts/selftest.py  无 Docker 自检（含双向校时、重启接管）
 ```

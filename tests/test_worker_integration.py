@@ -55,9 +55,10 @@ def env_for(db: Path, **extra: str) -> dict[str, str]:
 
 
 class Server:
-    def __init__(self, db: Path, port: int) -> None:
+    def __init__(self, db: Path, port: int, **extra_env: str) -> None:
         self.db = db
         self.port = port
+        self.extra_env = extra_env
         self.proc: subprocess.Popen | None = None
 
     def __enter__(self) -> "Server":
@@ -75,7 +76,7 @@ class Server:
                 "warning",
             ],
             cwd=ROOT,
-            env=env_for(self.db),
+            env=env_for(self.db, **self.extra_env),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -283,3 +284,88 @@ def test_late_worker_cannot_regress_or_false_complete(tmp_path):
         finally:
             stop_worker(worker_a)
             stop_worker(worker_b)
+
+
+def test_host_reboot_lease_is_reclaimed_immediately_and_weights_match(tmp_path, uninterrupted):
+    """A lease left over from a previous host boot must not stall the job.
+
+    First boot: the API and worker A share ``TRAINING_BOOT_ID=boot-one``; A
+    commits a few batches and is then SIGKILLed (the power loss) without
+    releasing its lease.  After the "reboot" a new API and worker B come up in
+    ``boot-two``.  B must take over without waiting out the nominal lease term,
+    resume from the last confirmed checkpoint, and finish with the
+    uninterrupted weights.
+    """
+    db = tmp_path / "training.db"
+
+    # --- First boot -------------------------------------------------------
+    with Server(db, free_port(), TRAINING_BOOT_ID="boot-one") as first:
+        job = first.post("/jobs", dataset())
+        worker_a = start_worker(db, "worker-a", TRAINING_BOOT_ID="boot-one")
+        try:
+            wait_for(
+                lambda: first.get(f"/jobs/{job['job_id']}")["completed_steps"] >= 3,
+                timeout=60,
+                message="first batches before reboot",
+            )
+        finally:
+            stop_worker(worker_a, hard=True)  # abrupt: no release, lease row remains
+        at_reboot = first.get(f"/jobs/{job['job_id']}")
+        assert at_reboot["status"] == "running"
+        assert 3 <= at_reboot["completed_steps"] < at_reboot["total_steps"]
+        stale_view = first.get("/workers")["leases"]
+        assert stale_view and stale_view[0]["worker_id"] == "worker-a"
+        assert stale_view[0]["same_boot"] is True
+        assert stale_view[0]["expired"] is False
+
+    # --- Reboot: new boot id for every process ----------------------------
+    with Server(db, free_port(), TRAINING_BOOT_ID="boot-two") as server:
+        # Through the new boot's eyes the leftover lease is already stale, even
+        # though no lease_seconds of monotonic time have passed since the kill.
+        leftover = server.get("/workers")["leases"]
+        assert leftover and leftover[0]["same_boot"] is False
+        assert leftover[0]["expired"] is True
+
+        start = time.time()
+        worker_b = start_worker(db, "worker-b", TRAINING_BOOT_ID="boot-two")
+        try:
+            def takeover_view():
+                rows = server.get("/workers")["leases"]
+                holders = [row for row in rows if row["worker_id"] == "worker-b"]
+                return holders[0] if holders else None
+
+            active_lease = wait_for(
+                takeover_view,
+                timeout=10,
+                message="immediate post-reboot takeover",
+            )
+            takeover_seconds = time.time() - start
+            final = wait_completed(server, job["job_id"])
+        finally:
+            stop_worker(worker_b)
+
+        assert takeover_seconds < LEASE_SECONDS, (
+            f"takeover after reboot took {takeover_seconds}s, longer than the lease term"
+        )
+        # Captured while B still holds the lease: its view must already match
+        # the takeover decision (same boot, not expired), proving /workers and
+        # actual ownership use one staleness predicate.
+        assert active_lease["same_boot"] is True
+        assert active_lease["expired"] is False
+        assert active_lease["lease_epoch"] >= 2
+        assert final["completed_steps"] == final["total_steps"]
+        assert final["final_weights"] == uninterrupted["final_weights"]
+        assert final["loss"] == uninterrupted["loss"]
+        assert final["momentum_velocity"] == uninterrupted["momentum_velocity"]
+
+        checkpoints = server.get(f"/jobs/{job['job_id']}/checkpoints")
+        assert [c["step"] for c in checkpoints] == list(range(1, final["total_steps"] + 1))
+        owners = {c["worker_id"] for c in checkpoints}
+        assert owners == {"worker-a", "worker-b"}
+        epochs = [c["lease_epoch"] for c in checkpoints]
+        assert epochs == sorted(epochs) and epochs[-1] > epochs[0]
+
+        events = server.get(f"/jobs/{job['job_id']}/events")
+        starts = [e for e in events if e["event"] == "training_started"]
+        assert [e["detail"]["worker_id"] for e in starts] == ["worker-a", "worker-b"]
+        assert starts[1]["detail"]["resumed_from_step"] == at_reboot["completed_steps"]

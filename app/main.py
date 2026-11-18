@@ -1,17 +1,17 @@
 """Training API service."""
 from __future__ import annotations
 
-import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import store
+from . import clock, store
 from .config import Settings
 from .db import init_db, reader
 from .features import InputError
+from .lease import is_stale
 
 settings = Settings.from_env()
 
@@ -113,25 +113,40 @@ def get_events(job_id: str) -> list[dict[str, Any]]:
 
 @app.get("/workers", tags=["system"])
 def get_workers() -> dict[str, Any]:
-    """Worker liveness and current lease state, for the demo."""
-    now = time.time()
+    """Worker liveness and current lease state, for the demo.
+
+    ``alive``/``expired`` use the exact same staleness predicate as a worker's
+    takeover attempt (boot identity plus monotonic elapsed time), so the state
+    shown here always matches whether another worker is actually allowed to
+    take over - independent of any wall-clock correction.
+    """
+    mono_now = clock.mono()
+    current_boot = clock.boot_id()
     with reader(settings.db_path) as conn:
         workers = conn.execute(
-            "SELECT worker_id, status, started_at, heartbeat_at FROM workers ORDER BY worker_id"
+            "SELECT worker_id, status, started_at, heartbeat_at, boot_id, mono_at "
+            "FROM workers ORDER BY worker_id"
         ).fetchall()
         leases = conn.execute(
-            "SELECT job_id, worker_id, epoch, heartbeat_at FROM leases ORDER BY job_id"
+            "SELECT job_id, worker_id, epoch, heartbeat_at, boot_id, mono_at "
+            "FROM leases ORDER BY job_id"
         ).fetchall()
     return {
         "lease_seconds": settings.lease_seconds,
+        "boot_id": current_boot,
         "workers": [
             {
                 "worker_id": row["worker_id"],
                 "status": row["status"],
                 "started_at": row["started_at"],
                 "heartbeat_at": row["heartbeat_at"],
-                "seconds_since_heartbeat": round(max(0.0, now - row["heartbeat_at"]), 3),
-                "alive": now - row["heartbeat_at"] < settings.lease_seconds,
+                "boot_id": row["boot_id"],
+                "same_boot": row["boot_id"] == current_boot,
+                "mono_seconds_since_heartbeat": round(
+                    max(0.0, mono_now - float(row["mono_at"])), 3
+                ),
+                "seconds_since_heartbeat": _wall_seconds(row["heartbeat_at"]),
+                "alive": not is_stale(row, settings.lease_seconds),
             }
             for row in workers
         ],
@@ -140,9 +155,20 @@ def get_workers() -> dict[str, Any]:
                 "job_id": row["job_id"],
                 "worker_id": row["worker_id"],
                 "lease_epoch": int(row["epoch"]),
-                "expired": now - float(row["heartbeat_at"]) >= settings.lease_seconds,
-                "seconds_since_heartbeat": round(max(0.0, now - row["heartbeat_at"]), 3),
+                "boot_id": row["boot_id"],
+                "same_boot": row["boot_id"] == current_boot,
+                "mono_seconds_since_heartbeat": round(
+                    max(0.0, mono_now - float(row["mono_at"])), 3
+                ),
+                "seconds_since_heartbeat": _wall_seconds(row["heartbeat_at"]),
+                "expired": is_stale(row, settings.lease_seconds),
             }
             for row in leases
         ],
     }
+
+
+def _wall_seconds(heartbeat_at: float) -> float:
+    """Wall-clock age for display only; never used for expiry decisions."""
+    age = clock.wall() - float(heartbeat_at)
+    return round(age if age > 0 else 0.0, 3)

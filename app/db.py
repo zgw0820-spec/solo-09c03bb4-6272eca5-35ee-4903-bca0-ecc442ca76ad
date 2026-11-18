@@ -63,14 +63,24 @@ CREATE TABLE IF NOT EXISTS workers (
     worker_id    TEXT PRIMARY KEY,
     status       TEXT NOT NULL,
     started_at   REAL NOT NULL,
-    heartbeat_at REAL NOT NULL
+    heartbeat_at REAL NOT NULL,
+    -- Wall-clock heartbeat_at stays for display only; liveness is decided by
+    -- boot_id + mono_at so host clock adjustments cannot expire a live worker.
+    boot_id      TEXT NOT NULL DEFAULT '',
+    mono_at      REAL NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS leases (
     job_id       TEXT PRIMARY KEY,
     worker_id    TEXT NOT NULL,
     epoch        INTEGER NOT NULL,
-    heartbeat_at REAL NOT NULL
+    heartbeat_at REAL NOT NULL,
+    -- Boot cycle in which the heartbeat was written, plus a monotonic-clock
+    -- timestamp.  A different boot_id means the heartbeat predates a reboot
+    -- and is stale at once; otherwise expiry is measured on the monotonic
+    -- clock, which never jumps when the host time is corrected.
+    boot_id      TEXT NOT NULL DEFAULT '',
+    mono_at      REAL NOT NULL DEFAULT 0
 );
 
 -- Monotonic per-job lease counter.  Leases themselves are deleted on release,
@@ -131,8 +141,24 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add monotonic-timing columns to databases created by older versions.
+
+    Rows written before the upgrade carry an empty ``boot_id`` / zero
+    ``mono_at``; the staleness predicate treats them as expired immediately,
+    so a leftover lease from the old wall-clock implementation can never block
+    a takeover after the upgrade.
+    """
+    for table in ("leases", "workers"):
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "boot_id" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''")
+        if "mono_at" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN mono_at REAL NOT NULL DEFAULT 0")
+
+
 def init_db(path: Path | str) -> None:
-    """Create the schema if missing.
+    """Create the schema if missing and migrate older databases in place.
 
     ``executescript`` commits implicitly, so it must not run inside our
     hand-managed transaction; concurrent starts serialise on SQLite's schema
@@ -141,5 +167,6 @@ def init_db(path: Path | str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
